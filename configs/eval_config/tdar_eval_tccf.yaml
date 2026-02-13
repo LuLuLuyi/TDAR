@@ -1,0 +1,31 @@
+model_base: "tdar"
+paths:
+    dataset_base: "/path/to/dataset"
+execute:
+    num_chunk: 128
+rollout:
+    tensor_parallel_size: 1
+    max_active: 2
+    temperature: 1.0
+    max_token: 30000
+    top_p: 1.0
+    top_k: 0
+    start_with_think: True
+    output_unmasking_history: False
+    stop_token_list: ["<|im_end|>"]
+
+    # two-stage parameters
+    think_block_size: 16
+    think_denoising_steps: 16
+    final_block_size: 1
+    final_denoising_steps: 1
+    
+    # low_confidence_dynamic
+    remasking_strategy: "low_confidence_dynamic"
+    dynamic_threshold: 0.9
+    
+    # bounded_adaptive_confidence_decoding
+    # remasking_strategy: "bounded_adaptive_confidence_decoding"
+    # confidence_upper_threshold: 0.9
+    # confidence_lower_threshold: 0.6
+    

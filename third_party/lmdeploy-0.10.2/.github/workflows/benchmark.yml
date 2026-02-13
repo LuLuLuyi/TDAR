@@ -1,0 +1,161 @@
+name: benchmark_test
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_org:
+        required: false
+        description: 'Tested repository organization name. Default is InternLM'
+        type: string
+        default: 'InternLM/lmdeploy'
+      repo_ref:
+        required: false
+        description: 'Set branch or tag or commit id. Default is "main"'
+        type: string
+        default: 'main'
+      benchmark_type:
+        required: true
+        description: 'Set benchmark type. Default is "["generation", "throughput", "api_server"]"'
+        type: string
+        default: "['apiserver', 'throughput']"
+      offline_mode:
+        required: true
+        description: 'Whether start a offline mode, if true, you should prepare code and whl package by yourself'
+        type: boolean
+        default: false
+
+env:
+  HOST_PIP_CACHE_DIR: /nvme/github-actions/pip-cache
+  HOST_LOCALTIME: /usr/share/zoneinfo/Asia/Shanghai
+  OUTPUT_FOLDER: cuda12.4_dist_${{ github.run_id }}
+  REPORT_DIR: /nvme/qa_test_models/benchmark-reports/${{ github.run_id }}
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  FAIL_CONFIG: ${{ github.run_attempt != 1 && '--lf --lfnf none' || '--lf'}}
+
+jobs:
+  linux-build:
+    if: ${{github.event_name == 'schedule' || (!cancelled() && !inputs.offline_mode)}}
+    strategy:
+      matrix:
+        pyver: [py310]
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: ${{ matrix.pyver }}
+      PLAT_NAME: manylinux2014_x86_64
+      DOCKER_TAG: cuda12.4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ github.event.inputs.repo_org || 'InternLM/lmdeploy' }}
+          ref: ${{github.event.inputs.repo_ref || 'main'}}
+      - name: Build
+        run: |
+          echo ${PYTHON_VERSION}
+          echo ${PLAT_NAME}
+          echo ${DOCKER_TAG}
+          echo ${OUTPUT_FOLDER}
+          echo ${GITHUB_RUN_ID}
+          # remove -it
+          sed -i 's/docker run --rm -it/docker run --rm/g' builder/manywheel/build_wheel.sh
+          bash builder/manywheel/build_wheel.sh ${PYTHON_VERSION} ${PLAT_NAME} ${DOCKER_TAG} ${OUTPUT_FOLDER}
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          path: builder/manywheel/${{ env.OUTPUT_FOLDER }}
+          retention-days: 1
+          name: my-artifact-${{ github.run_id }}-${{ matrix.pyver }}
+
+
+  benchmark:
+    needs: linux-build
+    if: ${{github.event_name == 'schedule' || !cancelled()}}
+    runs-on: [self-hosted, linux-a100]
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark_type: ${{fromJSON(github.event.inputs.benchmark_type)}}
+    timeout-minutes: 480
+    container:
+      image: openmmlab/lmdeploy:latest-cu12.8
+      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip -e NVIDIA_DISABLE_REQUIRE=1 --pull never"
+      volumes:
+        - /nvme/github-actions/pip-cache:/root/.cache/pip
+        - /nvme/github-actions/packages:/root/packages
+        - /nvme/qa_test_models:/nvme/qa_test_models
+        - /mnt/shared:/mnt/shared
+        - /mnt/bigdisk:/mnt/bigdisk
+        - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v2
+        if: ${{github.event_name == 'schedule' || !inputs.offline_mode}}
+        with:
+          repository: ${{ github.event.inputs.repo_org || 'InternLM/lmdeploy' }}
+          ref: ${{github.event.inputs.repo_ref || 'main'}}
+      - name: Copy repository - offline
+        if: ${{inputs.offline_mode}}
+        run: cp -r /nvme/qa_test_models/offline_pkg/lmdeploy/. .
+      - name: Download Artifacts
+        if: ${{github.event_name == 'schedule' || !inputs.offline_mode}}
+        uses: actions/download-artifact@v4
+        with:
+          name: my-artifact-${{ github.run_id }}-py310
+      - name: Install lmdeploy - dependency
+        run: |
+          python3 -m pip install -r /nvme/qa_test_models/offline_pkg/requirements.txt
+      - name: Install lmdeploy
+        if: ${{github.event_name == 'schedule' || !inputs.offline_mode}}
+        run: |
+          python3 -m pip uninstall lmdeploy -y && python3 -m pip install lmdeploy-*.whl --no-deps
+          python3 -m pip install -r requirements/test.txt
+      - name: Install lmdeploy - offline
+        if: ${{inputs.offline_mode}}
+        run: |
+          python3 -m pip install /nvme/qa_test_models/offline_pkg/py310/lmdeploy-*.whl --no-deps
+          python3 -m pip install -r requirements/test.txt
+      - name: Check env
+        run: |
+          python3 -m pip list
+          lmdeploy check_env
+          mkdir ${{env.REPORT_DIR}}/allure-results/.pytest_cache -p
+          ln -s ${{env.REPORT_DIR}}/allure-results/.pytest_cache autotest
+      - name: Run other benchmark
+        run: |
+            pytest autotest/benchmark/test_${{matrix.benchmark_type}}_performance.py -n 8 --run_id ${{ github.run_id }} -m 'gpu_num_1 and not pr_test' ${{env.FAIL_CONFIG}} --alluredir=${{env.REPORT_DIR}}/allure-results || true
+            pytest autotest/benchmark/test_${{matrix.benchmark_type}}_performance.py -n 4 --run_id ${{ github.run_id }} -m 'gpu_num_2 and not pr_test' ${{env.FAIL_CONFIG}} --alluredir=${{env.REPORT_DIR}}/allure-results || true
+            pytest autotest/benchmark/test_${{matrix.benchmark_type}}_performance.py -n 2 --run_id ${{ github.run_id }} -m 'gpu_num_4 and not pr_test' ${{env.FAIL_CONFIG}} --alluredir=${{env.REPORT_DIR}}/allure-results || true
+            pytest autotest/benchmark/test_${{matrix.benchmark_type}}_performance.py --run_id ${{ github.run_id }} -m 'gpu_num_8 and not pr_test' ${{env.FAIL_CONFIG}} --alluredir=${{env.REPORT_DIR}}/allure-results
+      - name: Clear workfile
+        if: always()
+        run: |
+          chmod -R 777 $REPORT_DIR
+          export workdir=$(pwd)
+          cd ..
+          rm -rf $workdir
+          mkdir $workdir
+          chmod -R 777 $workdir
+
+
+  get_result_overview:
+    if: always() && !cancelled()
+    needs: [benchmark]
+    timeout-minutes: 5
+    runs-on: [self-hosted, linux-a100]
+    container:
+      image: openmmlab/lmdeploy:latest-cu12.8
+      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip -e NVIDIA_DISABLE_REQUIRE=1 --pull never"
+      volumes:
+        - /nvme/qa_test_models:/nvme/qa_test_models
+        - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ github.event.inputs.repo_org || 'InternLM/lmdeploy' }}
+          ref: ${{github.event.inputs.repo_ref || 'main'}}
+      - name: Get overview
+        run: |
+          pip install pandas fire mmengine
+          python3 .github/scripts/action_tools.py generate_benchmark_report $REPORT_DIR
